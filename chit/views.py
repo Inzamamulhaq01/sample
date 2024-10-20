@@ -1,4 +1,3 @@
-from django.http import Http404
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -6,7 +5,6 @@ from .models import *
 from .serializers import *
 from rest_framework.authtoken.models import Token
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.authentication import SessionAuthentication, TokenAuthentication
 from decimal import Decimal
 from django.contrib.auth import update_session_auth_hash
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -46,98 +44,88 @@ class ChangePasswordView(APIView):
 
 
 
-
 class UserInstallmentView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
-    
-    def get(self,request):
+
+    def get(self, request):
         user = User.objects.select_related('chit_plan').get(id=request.user.id)
         payment_details = InstallmentSerializer(user).data
         return Response(payment_details, status=status.HTTP_200_OK)
-        
 
     def post(self, request):
         user = User.objects.select_related('chit_plan').get(id=request.user.id)
         chit_plan = user.chit_plan
-        
+
+        # Check if the user has completed the chit plan
         if user.total_pending_amount == user.total_amount_paid:
-            return Response({"message":"Your Already Completed The Chit Plan Claim Your Gold",
-                             "Amount Paid":user.total_amount_paid,
-                             "Bonus Amount":user.chit_plan.interest_amount,
-                             "Final Amount":user.total_amount_paid+user.chit_plan.interest_amount
-                             })
-        
-        
+            return Response({
+                "message": "You have already completed the Chit Plan. Claim your gold.",
+                "Amount Paid": user.total_amount_paid,
+                "Bonus Amount": user.chit_plan.interest_amount,
+                "Final Amount": user.total_amount_paid + user.chit_plan.interest_amount
+            })
+
         if not chit_plan:
             return Response({"error": "No chit plan assigned."}, status=status.HTTP_400_BAD_REQUEST)
 
         installment_amount = chit_plan.plan
         payment = Decimal(request.data.get('payment', 0))  # Convert payment to Decimal
 
-        
+        # Validate payment amount
+        if payment <= 0:
+            return Response({"error": "Payment amount must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if payment < installment_amount:
+            return Response({"error": f"Payment must be at least {installment_amount}."}, status=status.HTTP_400_BAD_REQUEST)
+
         # last_payment = Payment.objects.filter(user=user, chit_plan=chit_plan).order_by('-date_paid').first()
         # if last_payment and last_payment.date_paid.month == timezone.now().month:
         #     return Response({"error": "You have already made a payment for this month."},
         #                     status=status.HTTP_400_BAD_REQUEST)
-  
-        if installment_amount > payment:
-            # print(installment_amount)
-            # print(payment)
-            return Response({"error":f"payment is not less then {installment_amount}"})  
-        # Prevent overpayment
 
+        # Calculate total due amount (for missed months)
+        missed_months = user.missed_months
+
+        # Process missed payments first
+        if missed_months > 0:
+            total_due_for_missed = missed_months * installment_amount
             
-                     
-        if user.missed_months == 0 and payment >= chit_plan.plan:
-   
-            # Calculate total due amount (missed months + pending amount)
-            last_payment = Payment.objects.filter(user=user, chit_plan=chit_plan).order_by('-date_paid').first()
-            if last_payment and last_payment.date_paid.month == timezone.now().month:
-                return Response({"error": "You have already made a payment for this month."},
-                            status=status.HTTP_400_BAD_REQUEST)
-
-            remaining_payment = user.total_pending_amount - payment
-
-        
-            # Calculate total due amount (missed months + pending amount) 
+            if payment >= total_due_for_missed:
+                # Pay off all missed months
+                user.total_amount_paid += total_due_for_missed
+                user.months_paid += missed_months
+                user.missed_months = 0  # Reset missed months
+                payment -= total_due_for_missed  # Reduce payment by the amount used for missed months
+            else:
+                # Pay only part of the missed months
+                months_paid_with_payment = payment // installment_amount
+                user.missed_months -= months_paid_with_payment  # Reduce missed months based on payment
+                user.total_amount_paid += months_paid_with_payment * installment_amount  # Update total paid
+                user.months_paid += months_paid_with_payment  # Update months paid
+                payment = 0  # All payment has been accounted for
         else:
-            total_due = user.missed_months * installment_amount
-            remaining_payment = user.total_pending_amount - total_due  
-            user.missed_months = 0
-        
-        if payment > remaining_payment:
-            return Response({"error": f"Overpayment not allowed. Your remaining balance is {remaining_payment}."},
-                            status=status.HTTP_400_BAD_REQUEST)  
+            # No missed months, just process the current installment payment
+            if payment >= installment_amount:
+                months_to_pay = payment // installment_amount
+                user.months_paid += months_to_pay
+                user.total_amount_paid += months_to_pay * installment_amount
+                payment %= installment_amount  # Remaining amount after full months paid
 
-        # If payment covers all missed months and pending amounts
-        if remaining_payment == 0:
-            user.months_paid += user.missed_months
-            user.missed_months = 0
-            user.pending_amount = 0
-        # If payment covers more than one month or partial payment
-        elif payment >= installment_amount:
-            months_covered = payment // installment_amount
-            user.months_paid += int(months_covered)
-            # user.pending_amount = payment % installment_amount
-        # else:
-        #     user.pending_amount -= payment
+        # Check if this will create a duplicate installment entry
 
-        # Update total amounts
-        user.total_amount_paid += payment
-        
-        print(payment)
-        
         Payment.objects.create(
-            user=user,
-            chit_plan=chit_plan,
-            installment_number=user.months_paid,  # Update based on logic
-            amount_paid=user.total_amount_paid,
-            status='Paid',
-            last_payment_date=timezone.now(),
-            last_payment_amount=payment
-        )
+                user=user,
+                chit_plan=chit_plan,
+                installment_number=user.months_paid,  # Current month installment
+                amount_paid=user.total_amount_paid,  # Store the total amount paid so far
+                status='Paid',
+                last_payment_date=timezone.now(),
+                last_payment_amount=payment
+            )
 
+
+        # Save the user object
         user.save()
 
         return Response({"message": "Installment payment processed successfully."}, status=status.HTTP_200_OK)

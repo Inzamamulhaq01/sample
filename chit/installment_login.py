@@ -13,6 +13,7 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.tokens import RefreshToken
 
 
+
 class UserInstallmentView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
@@ -41,16 +42,27 @@ class UserInstallmentView(APIView):
         installment_amount = chit_plan.plan
         payment = Decimal(request.data.get('payment', 0))  # Convert payment to Decimal
 
-        # if payment <= 0:
-        #     return Response({"error": "Payment amount must be greater than zero."}, status=status.HTTP_400_BAD_REQUEST)
-        last_payment = Payment.objects.filter(user=user, chit_plan=chit_plan).order_by('-date_paid').first()
-        if last_payment and last_payment.date_paid.month == timezone.now().month:
-            return Response({"error": "You have already made a payment for this month."},
-                            status=status.HTTP_400_BAD_REQUEST)
+        
+        # last_payment = Payment.objects.filter(user=user, chit_plan=chit_plan).order_by('-date_paid').first()
+        # if last_payment and last_payment.date_paid.month == timezone.now().month:
+        #     return Response({"error": "You have already made a payment for this month."},
+        #                     status=status.HTTP_400_BAD_REQUEST)
+  
+        if installment_amount > payment:
+            # print(installment_amount)
+            # print(payment)
+            return Response({"error":f"payment is not less then {installment_amount}"})  
+        # Prevent overpayment
+
             
-            
+                     
         if user.missed_months == 0 and payment >= chit_plan.plan:
+   
             # Calculate total due amount (missed months + pending amount)
+            last_payment = Payment.objects.filter(user=user, chit_plan=chit_plan).order_by('-date_paid').first()
+            if last_payment and last_payment.date_paid.month == timezone.now().month:
+                return Response({"error": "You have already made a payment for this month."},
+                            status=status.HTTP_400_BAD_REQUEST)
 
             remaining_payment = user.total_pending_amount - payment
 
@@ -60,16 +72,17 @@ class UserInstallmentView(APIView):
             total_due = user.missed_months * installment_amount
             remaining_payment = user.total_pending_amount - total_due  
             user.missed_months = 0
-
-        # Prevent overpayment
+        
         if payment > remaining_payment:
             return Response({"error": f"Overpayment not allowed. Your remaining balance is {remaining_payment}."},
-                            status=status.HTTP_400_BAD_REQUEST)
+                            status=status.HTTP_400_BAD_REQUEST)  
 
         # If payment covers all missed months and pending amounts
+        month_no = payment // installment_amount
+
         if remaining_payment == 0:
             user.months_paid += user.missed_months
-            user.missed_months = 0
+            user.missed_months -= month_no
             user.pending_amount = 0
         # If payment covers more than one month or partial payment
         elif payment >= installment_amount:
@@ -78,20 +91,22 @@ class UserInstallmentView(APIView):
             # user.pending_amount = payment % installment_amount
         # else:
         #     user.pending_amount -= payment
-        print(payment)
-        print(remaining_payment)
+
         # Update total amounts
         user.total_amount_paid += payment
+        print(user.total_amount_paid)
+        
         
         Payment.objects.create(
-            user=user,
-            chit_plan=chit_plan,
-            installment_number=user.months_paid,  # Update based on logic
-            amount_paid=payment,
-            status='Paid',
-            last_payment_date=timezone.now(),
-            last_payment_amount=payment
-        )
+    user=user,
+    chit_plan=chit_plan,
+    installment_number=user.months_paid,  # Update based on logic
+    amount_paid=user.total_amount_paid,  # Store the total amount paid so far
+    status='Paid',
+    last_payment_date=timezone.now(),
+    last_payment_amount=payment # Store the current payment amount
+)
+
 
         user.save()
 

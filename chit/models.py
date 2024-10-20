@@ -1,4 +1,3 @@
-from email.policy import default
 from django.db import models
 from django.db.models.signals import post_save, pre_delete
 from django.dispatch import receiver
@@ -39,7 +38,6 @@ class ChitPlan(models.Model):
     def __str__(self):
         return f"Plan {self.plan}"
 
-
 class User(AbstractUser):
     phone_number = models.CharField(max_length=20)
     chit_plan = models.ForeignKey(ChitPlan, on_delete=models.CASCADE, null=True, blank=True, related_name='users')
@@ -48,49 +46,61 @@ class User(AbstractUser):
     pending_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     total_amount_paid = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     total_pending_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    first_time = models.BooleanField(default=True)
-    
-    # New field to track the current installment month
-    installment_number = models.PositiveIntegerField(default=1)
+    account_created_date = models.DateField(default=timezone.now)
 
-    def get_chit_plan_value(self):
-        return self.chit_plan.plan if self.chit_plan else None
+    def calculate_missed_months(self):
+        """Calculate the number of months missed based on account creation date."""
+        current_date = timezone.now().date()
+        account_creation_months = (current_date.year - self.account_created_date.year) * 12 + (current_date.month - self.account_created_date.month)
+        
+        # Calculate missed months
+        missed_months = max(account_creation_months - self.months_paid, 0)
+        self.missed_months = missed_months
 
-    def calculate_missed_months(self, current_month):
-        """Calculate how many months were missed."""
-        self.missed_months = current_month - self.months_paid
+        if self.chit_plan:
+            self.pending_amount = self.missed_months * self.chit_plan.plan
+            self.total_pending_amount = self.pending_amount
+        
         return self.missed_months
 
-    def update_pending_amount(self, current_month):
-        """Update the user's pending amount based on the chit plan and missed months."""
-        self.calculate_missed_months(current_month)
-        if self.chit_plan:
-            plan_amount = self.chit_plan.plan
-            self.pending_amount = plan_amount * self.missed_months
-            self.total_pending_amount = plan_amount * (11 - self.months_paid)
-            self.save()
+    def update_pending_amount(self):
+        """Update pending amount based on missed months."""
+        self.calculate_missed_months()
+        self.save()
 
     def make_payment(self, amount):
-        """Handle payment and update the months paid and pending amount."""
-        if amount == self.pending_amount:
+        """Process payment and update months paid."""
+        chit_plan_value = self.chit_plan.plan if self.chit_plan else Decimal(0)
+
+        if amount >= self.pending_amount:
+            # Full payment for missed months
             self.total_amount_paid += amount
             self.months_paid += self.missed_months
             self.missed_months = 0
             self.pending_amount = 0
-            self.current_installment_month += 1  # Update the installment month
-            self.save()
-            
-    def reduce_pending_amount(self, amount):
-        """Reduce the pending amount by the given amount."""
-        if amount >= self.pending_amount:
-            self.pending_amount = 0
         else:
-            self.pending_amount -= amount
+            # Partial payment
+            self.total_amount_paid += amount
+            
+            # Calculate how many full installments can be paid
+            installments_covered = int(amount // chit_plan_value)
+            if installments_covered > 0:
+                self.months_paid += installments_covered
+                self.missed_months -= installments_covered
+            
+            # Update pending amount after the partial payment
+            self.pending_amount = self.missed_months * chit_plan_value
+
         self.save()
 
     def calculate_final_payout(self):
-        """Calculate the final payout after 11 months."""
-        return self.total_amount_paid + self.chit_plan.interest_amount if self.months_paid == 11 else 0
+        """Calculate final payout after completing the plan."""
+        if self.months_paid == self.chit_plan.duration:
+            return self.total_amount_paid + self.chit_plan.interest_amount
+        return 0
+
+
+
 
 @receiver(post_save, sender=User)
 def log_user_creation(sender, instance, created, **kwargs):
@@ -126,7 +136,7 @@ class Payment(models.Model):
     date_paid = models.DateTimeField(default=timezone.now)
     status = models.CharField(max_length=10, default='Paid')
     last_payment_date = models.DateTimeField(null=True, blank=True)
-    last_payment_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    last_payment_amount = models.DecimalField(max_digits=10, decimal_places=2)
 
     def __str__(self):
         return f'User: {self.user.username} | Installment: {self.installment_number} | Amount: {self.amount_paid} | Status: {self.status}'
@@ -134,5 +144,4 @@ class Payment(models.Model):
     def save(self, *args, **kwargs):
         # Automatically update last payment fields when saving a payment
         self.last_payment_date = timezone.now()
-        self.last_payment_amount = self.amount_paid
         super(Payment, self).save(*args, **kwargs)
